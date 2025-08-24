@@ -86,8 +86,8 @@ namespace WoWLauncher.Updater
         {
             // Set default and prepare folders
             m_RealmAddress = "127.0.0.1";
-            if (!Directory.Exists("Data/enUS"))
-                Directory.CreateDirectory("Data/enUS");
+            if (!Directory.Exists("Data/esES"))
+                Directory.CreateDirectory("Data/esES");
 
             string url = m_ServerAddressUri;
             WebRequest request = WebRequest.Create(url);
@@ -154,7 +154,7 @@ namespace WoWLauncher.Updater
         {
             // Store complete versions
             string _onlineVersion = e.Result;
-            string _thisVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0";
+            string _thisVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.2";
             // Split into important bits
             string[] _onlineVersionParts = _onlineVersion.Split('.');
             string[] _localVersionParts = _thisVersion.Split('.');
