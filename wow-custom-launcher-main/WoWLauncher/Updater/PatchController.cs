@@ -1,300 +1,315 @@
-﻿using System;
+﻿// PatchController.cs — HttpClient, progreso y velocidad, y sin cierres inesperados.
+// Compatible con .NET Framework/WPF clásico.
+
+using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Security.Cryptography;
-using System.Security.Policy;
-using System.Windows;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace WoWLauncher.Patcher
 {
-    /// <summary>
-    /// Responsible for downloading new patches
-    /// </summary>
     internal class PatchController
     {
-        // Reference parent window
-        private MainWindow m_WndRef;
+        private readonly MainWindow m_WndRef;
 
-        // Data
-        private int m_PatchIndex;
-        private bool m_Patching;
-        private List<PatchData> m_Patches;
-        private readonly Stopwatch m_DownloadStopWatch;
+        private string m_PatchListUri = "";
+        private string m_PatchUri = "";
 
-        // Textfile containing patches (seperated on each line, md5 checksum next to it, e.g: Patch-L.mpq 6fd76dec2bbca6b58c7dce68b497e2bf)
-        private string m_PatchListUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/plist.txt";
-        // Folder containing the individual patches, as listed in the patch list file
-        private string m_PatchUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/";
+        private readonly Dictionary<string, string> m_PatchList;
+        private readonly List<string> m_DownloadQueue;
+        private int m_CurrentIndex;
 
-        /*
-         * HOW TO ORGANIZE YOUR PATCH SERVER
-         * 
-         
-            patch-folder (e.g www.example.com/Patch/) 
-                |
-                |- Patch
-                    |--- plist.txt       <== your list of patch files (each filename on seperate line)
-                    |--- realm.txt       <== contains the IP address of your game server
-                    |--- update.txt      <== version number of latest launcher
-                    |--- client.zip      <== latest launcher files as zip
-            
-                    |--- Patch-4.MPQ     <== list of patch files, can be any name (for WoW must start with "Patch-"
-                    |--- Patch-C.MPQ         and filenames must not contain spaces
-                    |--- ... etc
-         
-         *
-         *
-         */
+        private readonly HttpClient _http;
+        private CancellationTokenSource _cts;
+        private readonly Stopwatch _speedSw = new Stopwatch();
 
-        // Accessor
-        public bool IsPatching { get { return m_Patching; } }
+        // Acumuladores de progreso
+        private long _bytesTotalExpected;
+        private long _bytesTotalDownloaded;
 
-        public PatchController(MainWindow _wndRef)
+        public bool IsPatching { get; private set; }
+
+        public PatchController(MainWindow wndRef)
         {
-            m_WndRef = _wndRef;
-            m_DownloadStopWatch = new Stopwatch();
-            m_Patches = new List<PatchData>();
-            m_PatchIndex = -1;
+            m_WndRef = wndRef;
+            m_PatchList = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            m_DownloadQueue = new List<string>();
+            IsPatching = false;
+
+            var handler = new HttpClientHandler
+            {
+                AutomaticDecompression = DecompressionMethods.All,
+                AllowAutoRedirect = true,
+                UseProxy = true
+            };
+            _http = new HttpClient(handler);
+            _http.Timeout = TimeSpan.FromMinutes(10);
+
+            _cts = new CancellationTokenSource();
         }
 
-        /// <summary>
-        /// Begins checking server for patch files.
-        /// </summary>
-        /// <param name="_init">Is this the beginning of the check?</param>
-        public void CheckPatch(bool _init = true)
+        public async void CheckPatch(bool _init = true)
         {
-            if (_init)
-            {
-                // Reset and hide the progress info
-                m_WndRef.progressInfo.IsEnabled = false;
-                m_WndRef.progressBar.Value = 0;
-
-                // Check if patch list exists
-                WebRequest request = WebRequest.Create(m_PatchListUri);
-                try
-                {
-                    HttpWebResponse response = (HttpWebResponse)request.GetResponse();
-                }
-                catch
-                {
-                    // Reset various controls and stop
-                    m_WndRef.progressBar.Value = 100;
-                    m_WndRef.playBtn.IsEnabled = true;
-                    m_WndRef.progressInfo.Visibility = Visibility.Visible;
-                    m_WndRef.progressInfo.Content = "Unable to download patch list!";
-                    m_DownloadStopWatch.Reset();
-                    return;
-                }
-
-                // Update texts
-                m_WndRef.progressInfo.Visibility = Visibility.Visible;
-                m_WndRef.progressInfo.Content = "Getting patch list...";
-
-                // Prepare folders
-                if (!Directory.Exists("Cache/L"))
-                    Directory.CreateDirectory("Cache/L");
-                if (File.Exists("Cache/L/plist.txt"))
-                    File.Delete("Cache/L/plist.txt");
-
-                // Begin downloading patch list
-                using (WebClient wc = new WebClient())
-                {
-                    wc.DownloadFileAsync(
-                        new Uri(m_PatchListUri),
-                        "Cache/L/plist.txt"
-                    );
-                    wc.DownloadFileCompleted += patch_DonePatchListAsync;
-                }
-                return;
-            }
-
-            // Check if file was placed correctly
-            if (File.Exists("Cache/L/plist.txt"))
-            {
-                // Check if there's any patches available
-                m_Patches = PreparePatchList(File.ReadLines("Cache/L/plist.txt"));
-                if (m_Patches.Count > 0)
-                {
-                    // Prepare game data folder
-                    if (!Directory.Exists("Data"))
-                        Directory.CreateDirectory("Data");
-
-                    // Check for incomplete data
-                    if (File.Exists("Cache/L/patching"))
-                    {
-                        string _incomplete = File.ReadAllText("Cache/L/patching");
-
-                        // Remove incomplete patch files so we can download again
-                        if (File.Exists($"Data/{_incomplete}"))
-                            File.Delete($"Data/{_incomplete}");
-                    }
-
-                    // Begin the patch, start with first line
-                    m_PatchIndex = 0;
-                    m_WndRef.progressInfo.Content = "0% (Patch ?/?, downloaded 0/0 MB at 0 Mb/s)";
-                    // Create recovery flag
-                    File.WriteAllText("Cache/L/patching", m_Patches[m_PatchIndex].Filename);
-                    // Begin patching
-                    m_Patching = true;
-                    DownloadPatch(m_PatchIndex);
-                }
-                else
-                {
-                    // Finish up and return control
-                    FinishPatch();
-                }
-            }
-        }
-
-        /// <summary>
-        /// Create patch list
-        /// </summary>
-        /// <param name="_list">Raw patch list</param>
-        /// <returns>Organized patch data structre</returns>
-        private List<PatchData> PreparePatchList(IEnumerable<string> _list)
-        {
-            m_Patches = new List<PatchData>();
-            foreach (string _patch in _list)
-            {
-                string[] _data = _patch.Split(' ');
-                m_Patches.Add(new PatchData()
-                {
-                    Filename = _data[0],
-                    Checksum = _data[1]
-                });
-            }
-            return m_Patches;
-        }
-
-        /// <summary>
-        /// The patch was downloaded, check remaining patches.
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private void patch_DonePatchListAsync(object? sender, AsyncCompletedEventArgs e)
-        {
-            CheckPatch(false);
-        }
-
-        /// <summary>
-        /// Download patch at given index
-        /// </summary>
-        /// <param name="_index">Patch index from patch list</param>
-        private void DownloadPatch(int _index)
-        {
-            // Check if this patch was already downloaded previously
-            if (File.Exists($"Data/{m_Patches[m_PatchIndex]}"))
-            {
-                // Calculate hash of local downloaded patch
-                string _localHash = string.Empty;
-                using (MD5 _crypto = MD5.Create())
-                {
-                    using FileStream stream = File.OpenRead($"Data/{m_Patches[m_PatchIndex]}");
-                    _localHash = BitConverter.ToString(_crypto.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
-                }
-
-                // Compare checksums and skip patch if it matches (no changes)
-                if (_localHash.Equals(m_Patches[m_PatchIndex].Checksum))
-                {
-                    // Continue with next patch
-                    m_PatchIndex++;
-                    if (m_PatchIndex >= m_Patches.Count)
-                        FinishPatch(); // finish if nothing left
-                    else
-                        DownloadPatch(m_PatchIndex);
-                    return;
-                }
-            }
-
-            // Check if the given patch actually exists on server?
-            string url = $"{m_PatchUri}{m_Patches[m_PatchIndex]}";
-            WebRequest request = WebRequest.Create(url);
             try
             {
-                HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+                // === Resolver URLs base ===
+                string verFile = Path.Combine(AppContext.BaseDirectory, "Cache", "L", "version.txt");
+                string ver = File.Exists(verFile) ? File.ReadAllText(verFile).Trim() : "0.0";
+
+                string tagV = "v" + ver;
+                string baseUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tagV}/";
+                string testUrl = baseUrl + "plist.txt";
+
+                if (!await UrlExistsAsync(testUrl))
+                {
+                    string tagNoV = ver;
+                    baseUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tagNoV}/";
+                    testUrl = baseUrl + "plist.txt";
+                }
+
+                if (!await UrlExistsAsync(testUrl))
+                {
+                    baseUrl = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/";
+                    testUrl = baseUrl + "plist.txt";
+                }
+
+                m_PatchUri = baseUrl;
+                m_PatchListUri = testUrl;
+
+                // === Descargar y procesar plist ===
+                string rawData = await _http.GetStringAsync(m_PatchListUri);
+                Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Cache", "P"));
+                File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "Cache", "P", "plist_debug.txt"), rawData);
+
+                m_PatchList.Clear();
+                var lines = rawData.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var rawLine in lines)
+                {
+                    var line = rawLine.Trim();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 2) continue;
+
+                    string file = parts[0].Trim();
+                    string hash = parts[1].Trim().ToLowerInvariant();
+                    m_PatchList[file] = hash;
+                }
+
+                // === Preparar cola de descargas ===
+                m_DownloadQueue.Clear();
+                _bytesTotalExpected = 0;
+                _bytesTotalDownloaded = 0;
+
+                foreach (var kvp in m_PatchList)
+                {
+                    string localPath = Path.Combine(AppContext.BaseDirectory, "Data", kvp.Key); // Unificado "Data"
+                    if (!File.Exists(localPath) || GetMD5(localPath) != kvp.Value)
+                    {
+                        m_DownloadQueue.Add(kvp.Key);
+
+                        // Intentar leer tamaño por adelantado (para barra global)
+                        long size = await TryGetContentLengthAsync(m_PatchUri + kvp.Key);
+                        if (size > 0) _bytesTotalExpected += size;
+                    }
+                }
+
+                if (m_DownloadQueue.Count == 0)
+                {
+                    IsPatching = false;
+                    await UI(() =>
+                    {
+                        m_WndRef.progressInfo.Visibility = System.Windows.Visibility.Visible;
+                        m_WndRef.progressBar.Value = 1;
+                        m_WndRef.progressBar.Maximum = 1;
+                        m_WndRef.progressInfo.Text = "Parches actualizados.";
+                        m_WndRef.playBtn.IsEnabled = true;
+                    });
+                    return;
+                }
+
+                // === Descargar en serie con progreso ===
+                IsPatching = true;
+                _speedSw.Restart();
+
+                await UI(() =>
+                {
+                    m_WndRef.progressInfo.Visibility = System.Windows.Visibility.Visible;
+                    m_WndRef.playBtn.IsEnabled = false;
+                    m_WndRef.progressBar.Value = 0;
+                    m_WndRef.progressBar.Maximum = Math.Max((double)_bytesTotalExpected, 1.0);
+                });
+
+                for (m_CurrentIndex = 0; m_CurrentIndex < m_DownloadQueue.Count; m_CurrentIndex++)
+                {
+                    string file = m_DownloadQueue[m_CurrentIndex];
+                    string url = m_PatchUri + file;
+                    string targetPath = Path.Combine(AppContext.BaseDirectory, "Data", file);
+
+                    var dir = Path.GetDirectoryName(targetPath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
+
+                    await DownloadFileAsync(url, targetPath, (bytesThisFile, elapsed) =>
+                    {
+                        long downloadedSoFarLong = _bytesTotalDownloaded + bytesThisFile;
+
+                        UI_NoAwait(() =>
+                        {
+                            m_WndRef.progressBar.Value = Math.Min((double)downloadedSoFarLong, m_WndRef.progressBar.Maximum);
+
+                            double percent =
+                                m_WndRef.progressBar.Maximum > 0
+                                ? (m_WndRef.progressBar.Value / m_WndRef.progressBar.Maximum) * 100.0
+                                : 0.0;
+
+                            string speedStr = FormatSpeed(bytesThisFile, elapsed);
+
+                            m_WndRef.progressInfo.Text =
+                                string.Format(
+                                    "{0:0.0}%  •  {1}  ({2}/{3})  Descargado {4:0.0}/{5:0.0} MB  Velocidad {6}",
+                                    percent,
+                                    file,
+                                    m_CurrentIndex + 1,
+                                    m_DownloadQueue.Count,
+                                    ToMB(downloadedSoFarLong),
+                                    ToMB(Math.Max(_bytesTotalExpected, downloadedSoFarLong)),
+                                    speedStr
+                                );
+                        });
+                    });
+
+                    _bytesTotalDownloaded += new FileInfo(targetPath).Length;
+                }
+
+                _speedSw.Stop();
+                IsPatching = false;
+
+                await UI(() =>
+                {
+                    m_WndRef.progressBar.Value = m_WndRef.progressBar.Maximum;
+                    m_WndRef.progressInfo.Text = "Descarga de parches completada.";
+                    m_WndRef.playBtn.IsEnabled = true;
+                });
             }
-            catch
+            catch (Exception ex)
             {
-                // Stop process.
-                FinishPatch();
-                return;
+                IsPatching = false;
+                try
+                {
+                    Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Cache", "P"));
+                    File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "Cache", "P", "patch_log.txt"),
+                        "[" + DateTime.Now + "] ERROR: " + ex + Environment.NewLine);
+                }
+                catch { }
+
+                await UI(() =>
+                {
+                    System.Windows.MessageBox.Show(m_WndRef,
+                        "Error en la descarga de parches:\n" + ex.Message +
+                        "\n\nConsulta Cache/P/patch_log.txt y Cache/P/plist_debug.txt",
+                        "Patch Error", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
+                    m_WndRef.progressInfo.Text = "Error en la descarga de parches.";
+                    m_WndRef.playBtn.IsEnabled = true;
+                });
             }
+        }
 
-            // Update recovery flag
-            File.WriteAllText("Cache/L/patching", m_Patches[m_PatchIndex].Filename);
+        // --------- Helpers ---------
 
-            // Patch it in
-            using (WebClient wc = new())
+        private async Task<bool> UrlExistsAsync(string url)
+        {
+            try
             {
-                wc.DownloadProgressChanged += patch_GetPatchesAsync;
-                wc.DownloadFileAsync(
-                    new Uri($"{m_PatchUri}{m_Patches[m_PatchIndex]}"),
-                    $"Data/{m_Patches[m_PatchIndex]}"
-                );
-                wc.DownloadFileCompleted += patch_DonePatchesAsync;
-                m_DownloadStopWatch.Reset();
-                m_DownloadStopWatch.Start();
+                var req = new HttpRequestMessage(HttpMethod.Head, url);
+                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+                {
+                    return resp.IsSuccessStatusCode;
+                }
+            }
+            catch { return false; }
+        }
+
+        private async Task<long> TryGetContentLengthAsync(string url)
+        {
+            try
+            {
+                var req = new HttpRequestMessage(HttpMethod.Head, url);
+                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+                {
+                    if (resp.Content != null && resp.Content.Headers != null && resp.Content.Headers.ContentLength.HasValue)
+                        return resp.Content.Headers.ContentLength.Value;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        private async Task DownloadFileAsync(string url, string targetPath, Action<long, TimeSpan> onProgress)
+        {
+            using (var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+            {
+                resp.EnsureSuccessStatusCode();
+
+                var dir = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                using (var src = await resp.Content.ReadAsStreamAsync())
+                using (var dst = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
+                {
+                    var buffer = new byte[81920];
+                    long bytesThisFile = 0;
+                    var sw = Stopwatch.StartNew();
+
+                    while (true)
+                    {
+                        int read = await src.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
+                        if (read <= 0) break;
+
+                        await dst.WriteAsync(buffer, 0, read, _cts.Token);
+                        bytesThisFile += read;
+
+                        if (sw.ElapsedMilliseconds >= 200)
+                        {
+                            onProgress(bytesThisFile, sw.Elapsed);
+                            sw.Restart();
+                        }
+                    }
+
+                    onProgress(bytesThisFile, TimeSpan.FromMilliseconds(250));
+                }
             }
         }
 
-        /// <summary>
-        /// Completed patch, check for next.
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private void patch_DonePatchesAsync(object? sender, AsyncCompletedEventArgs e)
+        private static string FormatSpeed(long bytesRead, TimeSpan elapsed)
         {
-            m_PatchIndex++;
-            if (m_PatchIndex >= m_Patches.Count)
-                FinishPatch();
-            else
-                DownloadPatch(m_PatchIndex);
+            if (elapsed.TotalSeconds <= 0.0001) return "0 MB/s";
+            double speed = bytesRead / elapsed.TotalSeconds / (1024.0 * 1024.0);
+            return string.Format("{0:0.00} MB/s", speed);
         }
 
-        /// <summary>
-        /// Finish patching process and return control.
-        /// </summary>
-        private void FinishPatch()
+        private static double ToMB(long bytes)
         {
-            // Reset visual elements
-            m_WndRef.progressBar.Value = 100;
-            m_WndRef.playBtn.IsEnabled = true;
-            m_WndRef.progressInfo.Visibility = Visibility.Hidden;
-
-            // Reset download data and flags
-            m_Patching = false;
-            m_PatchIndex = -1;
-            m_Patches.Clear();
-            m_DownloadStopWatch.Reset();
-
-            // Clean up folders
-            if (File.Exists("Cache/L/patching"))
-                File.Delete("Cache/L/patching");
-            if (File.Exists("Cache/L/plist.txt"))
-                File.Delete("Cache/L/plist.txt");
+            return bytes / (1024.0 * 1024.0);
         }
 
-        /// <summary>
-        /// Update download progress of current patch.
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private void patch_GetPatchesAsync(object sender, DownloadProgressChangedEventArgs e)
+        private static string GetMD5(string filePath)
         {
-            m_WndRef.progressInfo.Content = $"{e.ProgressPercentage}% (Patch {m_PatchIndex + 1}/{m_Patches.Count}, downloaded {e.BytesReceived / 1024f / 1024f:0.0}/{e.TotalBytesToReceive / 1024f / 1024f:0.0} MB at {(e.BytesReceived / 1024f / 1024f / m_DownloadStopWatch.Elapsed.TotalSeconds).ToString("0.0")} Mb/s)";
-            m_WndRef.progressBar.Value = e.ProgressPercentage;
+            using (var md5 = MD5.Create())
+            using (var stream = File.OpenRead(filePath))
+            {
+                byte[] hash = md5.ComputeHash(stream);
+                return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+            }
         }
 
-        /// <summary>
-        /// Data structure for each patch file
-        /// </summary>
-        private struct PatchData
-        {
-            public string Filename;
-            public string Checksum;
-        }
+        private Task UI(Action a) => m_WndRef.Dispatcher.InvokeAsync(a).Task;
+        private void UI_NoAwait(Action a) => m_WndRef.Dispatcher.Invoke(a);
     }
 }

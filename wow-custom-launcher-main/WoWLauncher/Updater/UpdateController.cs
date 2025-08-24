@@ -1,4 +1,5 @@
-﻿using System;
+﻿// UpdateController.cs
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -7,202 +8,218 @@ using System.Windows;
 
 namespace WoWLauncher.Updater
 {
-    /// <summary>
-    /// Responsible for updating the launcher itself
-    /// </summary>
     internal class UpdateController
     {
-        // Reference parent window
-        private MainWindow m_WndRef;
+        private readonly MainWindow m_WndRef;
 
-        // Data
+        // Host/IP del realmlist actual
         private string m_RealmAddress;
-        private bool m_NeedsUpdate;
 
-        // Textfile containing version number of latest launcher (e.g 1.2) 
-        private string m_UpdateVersionUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/update.txt";
-        private string m_ServerAddressUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/realm.txt";
-        /*
-         * HOW TO ORGANIZE YOUR PATCH SERVER
-         * 
+        // WebClients persistentes para evitar Dispose prematuro con Async
+        private WebClient _wcUpdate;
+        private WebClient _wcRealm;
 
-            patch-folder (e.g www.example.com/Patch/) 
-                |
-                |- Patch
-                    |--- plist.txt       <== your list of patch files (each filename on seperate line)
-                    |--- realm.txt       <== contains the IP address of your game server
-                    |--- update.txt      <== version number of latest launcher
-                    |--- client.zip      <== latest launcher files as zip
+        // URLs en GitHub
+        private const string UpdateVersionUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/update.txt";
+        private const string ServerAddressUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/realm.txt";
 
-                    |--- Patch-4.MPQ     <== list of patch files, can be any name (for WoW must start with "Patch-"
-                    |--- Patch-C.MPQ    
-                    |--- ... etc
+        // Rutas locales
+        private static readonly string CacheDirL = Path.Combine(AppContext.BaseDirectory, "Cache", "L");
+        private static readonly string DataDirEsES = Path.Combine(AppContext.BaseDirectory, "Data", "esES"); // <- Data en mayúscula
+        private static readonly string VersionFile = Path.Combine(CacheDirL, "version.txt");
+        private static readonly string InProgress = Path.Combine(CacheDirL, "update_in_progress.flag");
+        private static readonly string RealmlistWtf = Path.Combine(DataDirEsES, "realmlist.wtf");
 
-         *
-         *
-         */
+        public string RealmAddress => m_RealmAddress;
 
-        // Accessor
-        public bool NeedsUpdate { get { return m_NeedsUpdate; } }
-        public string RealmAddress { get { return m_RealmAddress; } }
-
-        public UpdateController(MainWindow _wndRef)
+        // === Helper público para ServerCheck ===
+        public string GetRealmAddressSafe()
         {
-            m_WndRef = _wndRef;
-            m_NeedsUpdate = false;
+            // Devuelve localhost si aún no hay host válido
+            return string.IsNullOrWhiteSpace(m_RealmAddress) ? "0.0.0.0" : m_RealmAddress;
         }
 
-        /// <summary>
-        /// Begin checking for launcher updates.
-        /// </summary>
+        public UpdateController(MainWindow wndRef)
+        {
+            m_WndRef = wndRef;
+            Directory.CreateDirectory(CacheDirL);
+            Directory.CreateDirectory(DataDirEsES);
+        }
+
+        // ==== Comprobar updates del launcher ====
         public void CheckForUpdates()
         {
-            // Check if update file exists
-            string url = m_UpdateVersionUri;
-            WebRequest request = WebRequest.Create(url);
             try
             {
-                HttpWebResponse response = (HttpWebResponse)request.GetResponse();
-            }
-            catch
-            {
-                // Reset and continue business as usual
-                m_NeedsUpdate = false;
-                return;
-            }
-
-            // Begin downloading update info
-            using (WebClient wc = new())
-            {
-                wc.DownloadStringAsync(new Uri(m_UpdateVersionUri), "Cache/L/version.txt");
-                wc.DownloadStringCompleted += update_DoneRetrieveAsync;
-            }
-        }
-
-        /// <summary>
-        /// Retrieve latest game server address.
-        /// </summary>
-        public void RetrieveRealmIP()
-        {
-            // Set default and prepare folders
-            m_RealmAddress = "127.0.0.1";
-            if (!Directory.Exists("Data/esES"))
-                Directory.CreateDirectory("Data/esES");
-
-            string url = m_ServerAddressUri;
-            WebRequest request = WebRequest.Create(url);
-            try
-            {
-                HttpWebResponse response = (HttpWebResponse)request.GetResponse();
-            }
-            catch
-            {
-                // No server file online, check if local file exists
-                if (File.Exists("Data/enUS/realmlist.wtf"))
+                // Reciclar cliente previo si lo hubiera
+                if (_wcUpdate != null)
                 {
-                    // Read existing file and save it for this session
-                    string _realmd = File.ReadAllText("Data/enUS/realmlist.wtf");
-                    if (_realmd.Length > 0)
-                    {
-                        string[] _realmParts = _realmd.Split(' ');
-                        m_RealmAddress = _realmParts[2];
-                    }
+                    _wcUpdate.DownloadStringCompleted -= update_DoneRetrieveAsync;
+                    _wcUpdate.Dispose();
+                    _wcUpdate = null;
                 }
-                else // create new dummy file if nothing else exists. Silly.
-                    File.WriteAllText("Data/enUS/realmlist.wtf", $"set realmlist {m_RealmAddress}");
 
-                return;
+                _wcUpdate = new WebClient();
+                _wcUpdate.DownloadStringCompleted += update_DoneRetrieveAsync;
+                string url = UpdateVersionUri + "?t=" + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                _wcUpdate.DownloadStringAsync(new Uri(url));
             }
-
-            // Update texts
-            m_WndRef.progressInfo.Visibility = Visibility.Visible;
-            m_WndRef.progressInfo.Content = "Updating server IP...";
-
-            // Prepare folders
-            if (!Directory.Exists("Cache/L"))
-                Directory.CreateDirectory("Cache/L");
-            if (File.Exists("Cache/L/realm.txt"))
-                File.Delete("Cache/L/realm.txt");
-
-            // Begin downloading server address update
-            using (WebClient wc = new())
+            catch
             {
-                wc.DownloadStringAsync(new Uri(m_ServerAddressUri), "Cache/L/realm.txt");
-                wc.DownloadStringCompleted += realm_DonePatchListAsync;
+                // Ignorar
             }
-            return;
         }
 
-        /// <summary>
-        /// Completed server address update, apply.
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private void realm_DonePatchListAsync(object sender, DownloadStringCompletedEventArgs e)
-        {
-            File.WriteAllText("Data/enUS/realmlist.wtf", $"set realmlist {e.Result}");
-            if (File.Exists("Cache/L/realm.txt"))
-                File.Delete("Cache/L/realm.txt");
-        }
-
-        /// <summary>
-        /// Completed update download, check if it's newer
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
         private void update_DoneRetrieveAsync(object sender, DownloadStringCompletedEventArgs e)
         {
-            // Store complete versions
-            string _onlineVersion = e.Result;
-            string _thisVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.2";
-            // Split into important bits
-            string[] _onlineVersionParts = _onlineVersion.Split('.');
-            string[] _localVersionParts = _thisVersion.Split('.');
-
-            // This is a little silly, but it gets the job done
-            m_NeedsUpdate = false;
-            if (int.TryParse(_onlineVersionParts[0], out int _majorVersionOnline))
+            try
             {
-                if (int.TryParse(_localVersionParts[0], out int _majorVersionLocal))
-                {
-                    // Major update, definitely update
-                    if (_majorVersionOnline > _majorVersionLocal)
-                        m_NeedsUpdate = true;
+                string onlineRaw = ((e.Result ?? "0.0").Trim());
+                string[] parts = onlineRaw.Split('.');
+                string onlineMajorMinor = parts.Length >= 2 ? $"{parts[0]}.{parts[1]}"
+                                                            : (parts.Length == 1 ? $"{parts[0]}.0" : "0.0");
 
-                    // Same major version? Check for minor update
-                    if (_majorVersionOnline == _majorVersionLocal)
+                string localRaw = (Assembly.GetExecutingAssembly().GetName().Version != null
+                    ? Assembly.GetExecutingAssembly().GetName().Version.ToString()
+                    : "0.0").Trim();
+                string[] lparts = localRaw.Split('.');
+                string localMajorMinor = lparts.Length >= 2 ? $"{lparts[0]}.{lparts[1]}"
+                                                            : (lparts.Length == 1 ? $"{lparts[0]}.0" : "0.0");
+
+                Version onlineVer = Version.TryParse(onlineMajorMinor, out var v1) ? v1 : new Version(0, 0);
+                Version localVer = Version.TryParse(localMajorMinor, out var v2) ? v2 : new Version(0, 0);
+
+                Directory.CreateDirectory(CacheDirL);
+                File.WriteAllText(VersionFile, onlineMajorMinor);
+
+                if (onlineVer > localVer)
+                {
+                    if (File.Exists(InProgress))
                     {
-                        if (int.TryParse(_onlineVersionParts[1], out int _minorVersionOnline))
+                        File.Delete(InProgress);
+                        MessageBox.Show(m_WndRef,
+                            "Se detectó una actualización, pero el ejecutable no fue reemplazado.\n" +
+                            "Verifica que Updater descargue y extraiga el client.zip con permisos correctos.",
+                            "Actualización no aplicada",
+                            MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    var result = MessageBox.Show(m_WndRef,
+                        "Hay una actualización del launcher. ¿Quieres actualizar ahora?",
+                        "Update disponible!", MessageBoxButton.YesNo, MessageBoxImage.Information);
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        string updaterExe = Path.Combine(AppContext.BaseDirectory, "Updater.exe");
+                        if (File.Exists(updaterExe))
                         {
-                            if (int.TryParse(_localVersionParts[1], out int _minorVersionLocal))
+                            File.WriteAllText(InProgress, DateTime.UtcNow.ToString("o"));
+                            var pid = Process.GetCurrentProcess().Id;
+
+                            // Lanza el Updater primero (con el PID actual) y luego cierra
+                            Process.Start(new ProcessStartInfo(updaterExe)
                             {
-                                // Minor update, update anyway
-                                if (_minorVersionOnline > _minorVersionLocal)
-                                    m_NeedsUpdate = true;
-                            }
+                                UseShellExecute = true,
+                                Arguments = pid.ToString()
+                            });
+
+                            Application.Current.Shutdown();
                         }
                     }
                 }
-            }
-
-            // Actual update available, 
-            if (m_NeedsUpdate)
-            {
-                // Ask for installation
-                if (MessageBox.Show(m_WndRef, "The launcher has an update. Do you want to update now?", "Update available!", MessageBoxButton.YesNo, MessageBoxImage.Information, MessageBoxResult.Yes, MessageBoxOptions.DefaultDesktopOnly) == MessageBoxResult.Yes)
+                else
                 {
-                    // Switch to updater software
-                    if (File.Exists("Updater.exe"))
-                    {
-                        Application.Current.Shutdown();
-                        Process.Start(new ProcessStartInfo("Updater.exe")
-                        {
-                            UseShellExecute = true
-                        });
-                    }
-                    else // uh-oh. Oh well.
-                        MessageBox.Show(m_WndRef, "The launcher has an update but the updater is missing.", "Updater missing!", MessageBoxButton.OK, MessageBoxImage.Error);
+                    if (File.Exists(InProgress)) File.Delete(InProgress);
                 }
+            }
+            catch
+            {
+                // Ignorar errores silenciosamente
+            }
+            finally
+            {
+                if (_wcUpdate != null)
+                {
+                    _wcUpdate.DownloadStringCompleted -= update_DoneRetrieveAsync;
+                    _wcUpdate.Dispose();
+                    _wcUpdate = null;
+                }
+            }
+        }
+
+        // ==== Actualizar Realmlist ====
+        public void RetrieveRealmIP()
+        {
+            // Valor por defecto (por si falla la descarga)
+            m_RealmAddress = "wow.horizongames.es";
+
+            try
+            {
+                if (_wcRealm != null)
+                {
+                    _wcRealm.DownloadStringCompleted -= realm_DonePatchListAsync;
+                    _wcRealm.Dispose();
+                    _wcRealm = null;
+                }
+
+                _wcRealm = new WebClient();
+                _wcRealm.DownloadStringCompleted += realm_DonePatchListAsync;
+                string url = ServerAddressUri + "?t=" + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                _wcRealm.DownloadStringAsync(new Uri(url));
+            }
+            catch
+            {
+                FallbackRealmFromLocal();
+            }
+        }
+
+        private void realm_DonePatchListAsync(object sender, DownloadStringCompletedEventArgs e)
+        {
+            try
+            {
+                string addr = (e.Result ?? "").Trim();
+                if (!string.IsNullOrWhiteSpace(addr))
+                    m_RealmAddress = addr;
+
+                Directory.CreateDirectory(DataDirEsES);
+                File.WriteAllText(RealmlistWtf, $"set realmlist {m_RealmAddress}");
+            }
+            catch
+            {
+                FallbackRealmFromLocal();
+            }
+            finally
+            {
+                if (_wcRealm != null)
+                {
+                    _wcRealm.DownloadStringCompleted -= realm_DonePatchListAsync;
+                    _wcRealm.Dispose();
+                    _wcRealm = null;
+                }
+            }
+        }
+
+        private void FallbackRealmFromLocal()
+        {
+            try
+            {
+                Directory.CreateDirectory(DataDirEsES);
+                if (File.Exists(RealmlistWtf))
+                {
+                    string content = File.ReadAllText(RealmlistWtf).Trim();
+                    var parts = content.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 3 && parts[0] == "set" && parts[1] == "realmlist")
+                        m_RealmAddress = parts[2];
+                }
+                else
+                {
+                    File.WriteAllText(RealmlistWtf, $"set realmlist {m_RealmAddress}");
+                }
+            }
+            catch
+            {
+                // Ignorar
             }
         }
     }
