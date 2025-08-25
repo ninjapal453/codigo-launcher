@@ -1,5 +1,5 @@
-﻿// PatchController.cs — HttpClient, progreso y velocidad, y sin cierres inesperados.
-// Solo “live” (sin beta). Compatible con .NET Framework/WPF clásico.
+﻿// PatchController.cs — LIVE con R2 público (r2.dev), progreso y velocidad.
+// Compatible con .NET Framework/WPF clásico.
 
 using System;
 using System.Collections.Generic;
@@ -28,11 +28,13 @@ namespace WoWLauncher.Patcher
         private CancellationTokenSource _cts;
         private readonly Stopwatch _speedSw = new Stopwatch();
 
-        // Acumuladores de progreso
         private long _bytesTotalExpected;
         private long _bytesTotalDownloaded;
 
         public bool IsPatching { get; private set; }
+
+        // === URL PÚBLICA DE TU BUCKET R2 (SIN DOMINIOS PROPIOS) ===
+        private const string R2_PUBLIC_BASE = "https://pub-23b561d8083642d6a10b3ecab65d8834.r2.dev/";
 
         public PatchController(MainWindow wndRef)
         {
@@ -47,48 +49,32 @@ namespace WoWLauncher.Patcher
                 AllowAutoRedirect = true,
                 UseProxy = true
             };
-            _http = new HttpClient(handler)
-            {
-                Timeout = TimeSpan.FromMinutes(10)
-            };
+            _http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
 
             _cts = new CancellationTokenSource();
         }
 
-        // === MÉTODO PÚBLICO QUE ESTÁS BUSCANDO ===
+        // === MÉTODO PÚBLICO ===
         public async void CheckPatch(bool _init = true)
         {
             try
             {
-                // === Resolver URLs base (solo LIVE) ===
-                string verFile = Path.Combine(AppContext.BaseDirectory, "Cache", "L", "version.txt");
-                string ver = File.Exists(verFile) ? File.ReadAllText(verFile).Trim() : "0.0";
+                // 1) Base fija R2 (r2.dev)
+                m_PatchUri = EnsureSlash(R2_PUBLIC_BASE); // p.ej. https://...r2.dev/
+                m_PatchListUri = m_PatchUri + "plist.txt";
 
-                // 1) Intentar con releases/tag vX.Y (live)
-                string tagV = "v" + ver;
-                string baseUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tagV}/";
-                string testUrl = baseUrl + "plist.txt";
+                // 2) Validar existencia de plist.txt (GET range 0-0 para evitar problemas con HEAD)
+                if (!await UrlExistsAsync(m_PatchListUri).ConfigureAwait(false))
+                    throw new FileNotFoundException("No se encontró plist.txt en la URL pública del bucket R2.\nURL: " + m_PatchListUri);
 
-                if (!await UrlExistsAsync(testUrl).ConfigureAwait(false))
+                // 3) Descargar y parsear plist
+                string rawData;
+                using (var resp = await _http.GetAsync(m_PatchListUri, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
                 {
-                    // 2) Intentar con releases/tag X.Y (sin la 'v')
-                    string tagNoV = ver;
-                    baseUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tagNoV}/";
-                    testUrl = baseUrl + "plist.txt";
+                    if (!resp.IsSuccessStatusCode)
+                        throw new HttpRequestException($"No se pudo obtener plist.txt: HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}");
+                    rawData = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                 }
-
-                if (!await UrlExistsAsync(testUrl).ConfigureAwait(false))
-                {
-                    // 3) Fallback a rama main (live)
-                    baseUrl = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/";
-                    testUrl = baseUrl + "plist.txt";
-                }
-
-                m_PatchUri = baseUrl;
-                m_PatchListUri = testUrl;
-
-                // === Descargar y procesar plist ===
-                string rawData = await _http.GetStringAsync(m_PatchListUri).ConfigureAwait(false);
 
                 Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Cache", "P"));
                 File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "Cache", "P", "plist_debug.txt"), rawData);
@@ -108,20 +94,25 @@ namespace WoWLauncher.Patcher
                     m_PatchList[file] = hash;
                 }
 
-                // === Preparar cola de descargas ===
+                // 4) Preparar cola y bytes totales
                 m_DownloadQueue.Clear();
                 _bytesTotalExpected = 0;
                 _bytesTotalDownloaded = 0;
 
                 foreach (var kvp in m_PatchList)
                 {
-                    string localPath = Path.Combine(AppContext.BaseDirectory, "Data", kvp.Key); // Unificado "Data"
+                    string key = kvp.Key;
+
+                    // Evitar Data/Data/... en disco si las claves empiezan por Data/
+                    string localRel = key.StartsWith("Data/", StringComparison.OrdinalIgnoreCase)
+                        ? key.Substring("Data/".Length)
+                        : key;
+
+                    string localPath = Path.Combine(AppContext.BaseDirectory, "Data", localRel);
                     if (!File.Exists(localPath) || GetMD5(localPath) != kvp.Value)
                     {
-                        m_DownloadQueue.Add(kvp.Key);
-
-                        // Intentar leer tamaño por adelantado (para barra global)
-                        long size = await TryGetContentLengthAsync(m_PatchUri + kvp.Key).ConfigureAwait(false);
+                        m_DownloadQueue.Add(key); // en remoto usamos la clave tal cual (puede incluir Data/)
+                        long size = await TryGetContentLengthAsync(m_PatchUri + key).ConfigureAwait(false);
                         if (size > 0) _bytesTotalExpected += size;
                     }
                 }
@@ -140,7 +131,7 @@ namespace WoWLauncher.Patcher
                     return;
                 }
 
-                // === Descargar en serie con progreso ===
+                // 5) Descarga con progreso global
                 IsPatching = true;
                 _speedSw.Restart();
 
@@ -154,9 +145,14 @@ namespace WoWLauncher.Patcher
 
                 for (m_CurrentIndex = 0; m_CurrentIndex < m_DownloadQueue.Count; m_CurrentIndex++)
                 {
-                    string file = m_DownloadQueue[m_CurrentIndex];
-                    string url = m_PatchUri + file;
-                    string targetPath = Path.Combine(AppContext.BaseDirectory, "Data", file);
+                    string key = m_DownloadQueue[m_CurrentIndex];
+
+                    string localRel = key.StartsWith("Data/", StringComparison.OrdinalIgnoreCase)
+                        ? key.Substring("Data/".Length)
+                        : key;
+
+                    string url = m_PatchUri + key; // remoto
+                    string targetPath = Path.Combine(AppContext.BaseDirectory, "Data", localRel);
 
                     var dir = Path.GetDirectoryName(targetPath);
                     if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
@@ -172,8 +168,8 @@ namespace WoWLauncher.Patcher
 
                             double percent =
                                 m_WndRef.progressBar.Maximum > 0
-                                ? (m_WndRef.progressBar.Value / m_WndRef.progressBar.Maximum) * 100.0
-                                : 0.0;
+                                    ? (m_WndRef.progressBar.Value / m_WndRef.progressBar.Maximum) * 100.0
+                                    : 0.0;
 
                             string speedStr = FormatSpeed(bytesThisFile, elapsed);
 
@@ -181,7 +177,7 @@ namespace WoWLauncher.Patcher
                                 string.Format(
                                     "{0:0.0}%  •  {1}  ({2}/{3})  Descargado {4:0.0}/{5:0.0} MB  Velocidad {6}",
                                     percent,
-                                    file,
+                                    key,
                                     m_CurrentIndex + 1,
                                     m_DownloadQueue.Count,
                                     ToMB(downloadedSoFarLong),
@@ -191,7 +187,7 @@ namespace WoWLauncher.Patcher
                         });
                     }).ConfigureAwait(false);
 
-                    _bytesTotalDownloaded += new FileInfo(targetPath).Length;
+                    try { _bytesTotalDownloaded += new FileInfo(targetPath).Length; } catch { }
                 }
 
                 _speedSw.Stop();
@@ -211,7 +207,7 @@ namespace WoWLauncher.Patcher
                 {
                     Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Cache", "P"));
                     File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "Cache", "P", "patch_log.txt"),
-                        "[" + DateTime.Now + "] ERROR: " + ex + Environment.NewLine);
+                        $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ERROR: {ex}\n  PatchListUri: {m_PatchListUri}\n  PatchUri: {m_PatchUri}\n");
                 }
                 catch { }
 
@@ -229,28 +225,36 @@ namespace WoWLauncher.Patcher
 
         // --------- Helpers ---------
 
+        private static string EnsureSlash(string url) => url.EndsWith("/") ? url : (url + "/");
+
+        // GET ligero (Range 0-0) para existencia; más fiable que HEAD con algunos proxies/CDN
         private async Task<bool> UrlExistsAsync(string url)
         {
             try
             {
-                var req = new HttpRequestMessage(HttpMethod.Head, url);
-                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                using (var req = new HttpRequestMessage(HttpMethod.Get, url))
                 {
-                    return resp.IsSuccessStatusCode;
+                    req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                    using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                        return resp.IsSuccessStatusCode;
                 }
             }
             catch { return false; }
         }
 
+        // Intento de obtener Content-Length (si el servidor lo expone)
         private async Task<long> TryGetContentLengthAsync(string url)
         {
             try
             {
-                var req = new HttpRequestMessage(HttpMethod.Head, url);
-                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                using (var req = new HttpRequestMessage(HttpMethod.Get, url))
                 {
-                    if (resp.Content != null && resp.Content.Headers != null && resp.Content.Headers.ContentLength.HasValue)
-                        return resp.Content.Headers.ContentLength.Value;
+                    req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                    using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                    {
+                        if (resp.Content?.Headers?.ContentLength.HasValue == true)
+                            return resp.Content.Headers.ContentLength.Value;
+                    }
                 }
             }
             catch { }
@@ -298,13 +302,10 @@ namespace WoWLauncher.Patcher
         {
             if (elapsed.TotalSeconds <= 0.0001) return "0 MB/s";
             double speed = bytesRead / elapsed.TotalSeconds / (1024.0 * 1024.0);
-            return string.Format("{0:0.00} MB/s", speed);
+            return $"{speed:0.00} MB/s";
         }
 
-        private static double ToMB(long bytes)
-        {
-            return bytes / (1024.0 * 1024.0);
-        }
+        private static double ToMB(long bytes) => bytes / (1024.0 * 1024.0);
 
         private static string GetMD5(string filePath)
         {
