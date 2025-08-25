@@ -63,17 +63,7 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Top" Margin="0,0,0,8">
-                    <Image x:Name="serverStatusIcon"
-                           Width="16" Height="16"
-                           Margin="0,0,8,0"
-                           Source="pack://application:,,,/images/Indicator-Yellow.PNG"/>
-                    <TextBlock x:Name="serverStatus"
-                               Text="Comprobando servidor..."
-                               Foreground="#E6E6E6"
-                               FontSize="14"
-                               VerticalAlignment="Center"/>
-                </StackPanel>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Top" Margin="0,0,0,8"/>
 
                 <Button
                         Width="32" Height="32"
@@ -138,5 +128,12 @@
                         IsEnabled="False"/>
             </StackPanel>
         </Grid>
+        <Image x:Name="serverStatusIcon"
+            Source="/images/Indicator-Yellow.PNG" Margin="345,504,499,80"/>
+        <TextBlock x:Name="serverStatus"
+            Text="Comprobando servidor..."
+            Foreground="#E6E6E6"
+            FontSize="14"
+                               Margin="369,502,339,78"/>
     </Grid>
 </Window>
