@@ -1,5 +1,4 @@
-﻿// PatchController.cs — LIVE con R2 público (r2.dev), progreso y velocidad.
-// Compatible con .NET Framework/WPF clásico.
+﻿// PatchController.cs — R2 público (r2.dev), progreso/velocidad/%/restante correctos (.NET Framework/WPF)
 
 using System;
 using System.Collections.Generic;
@@ -33,7 +32,7 @@ namespace WoWLauncher.Patcher
 
         public bool IsPatching { get; private set; }
 
-        // === URL PÚBLICA DE TU BUCKET R2 (SIN DOMINIOS PROPIOS) ===
+        // URL pública R2
         private const string R2_PUBLIC_BASE = "https://pub-23b561d8083642d6a10b3ecab65d8834.r2.dev/";
 
         public PatchController(MainWindow wndRef)
@@ -45,7 +44,7 @@ namespace WoWLauncher.Patcher
 
             var handler = new HttpClientHandler
             {
-                AutomaticDecompression = DecompressionMethods.All,
+                AutomaticDecompression = DecompressionMethods.None,
                 AllowAutoRedirect = true,
                 UseProxy = true
             };
@@ -54,26 +53,26 @@ namespace WoWLauncher.Patcher
             _cts = new CancellationTokenSource();
         }
 
-        // === MÉTODO PÚBLICO ===
         public async void CheckPatch(bool _init = true)
         {
             try
             {
-                // 1) Base fija R2 (r2.dev)
-                m_PatchUri = EnsureSlash(R2_PUBLIC_BASE); // p.ej. https://...r2.dev/
+                m_PatchUri = EnsureSlash(R2_PUBLIC_BASE);
                 m_PatchListUri = m_PatchUri + "plist.txt";
 
-                // 2) Validar existencia de plist.txt (GET range 0-0 para evitar problemas con HEAD)
                 if (!await UrlExistsAsync(m_PatchListUri).ConfigureAwait(false))
                     throw new FileNotFoundException("No se encontró plist.txt en la URL pública del bucket R2.\nURL: " + m_PatchListUri);
 
-                // 3) Descargar y parsear plist
                 string rawData;
-                using (var resp = await _http.GetAsync(m_PatchListUri, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                using (var req = new HttpRequestMessage(HttpMethod.Get, m_PatchListUri))
                 {
-                    if (!resp.IsSuccessStatusCode)
-                        throw new HttpRequestException($"No se pudo obtener plist.txt: HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}");
-                    rawData = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    req.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
+                    using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                    {
+                        if (!resp.IsSuccessStatusCode)
+                            throw new HttpRequestException($"No se pudo obtener plist.txt: HTTP {(int)resp.StatusCode} {resp.ReasonPhrase}");
+                        rawData = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    }
                 }
 
                 Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Cache", "P"));
@@ -84,7 +83,7 @@ namespace WoWLauncher.Patcher
                 foreach (var rawLine in lines)
                 {
                     var line = rawLine.Trim();
-                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) continue;
 
                     string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
                     if (parts.Length < 2) continue;
@@ -94,7 +93,6 @@ namespace WoWLauncher.Patcher
                     m_PatchList[file] = hash;
                 }
 
-                // 4) Preparar cola y bytes totales
                 m_DownloadQueue.Clear();
                 _bytesTotalExpected = 0;
                 _bytesTotalDownloaded = 0;
@@ -102,16 +100,37 @@ namespace WoWLauncher.Patcher
                 foreach (var kvp in m_PatchList)
                 {
                     string key = kvp.Key;
-
-                    // Evitar Data/Data/... en disco si las claves empiezan por Data/
                     string localRel = key.StartsWith("Data/", StringComparison.OrdinalIgnoreCase)
                         ? key.Substring("Data/".Length)
                         : key;
-
                     string localPath = Path.Combine(AppContext.BaseDirectory, "Data", localRel);
-                    if (!File.Exists(localPath) || GetMD5(localPath) != kvp.Value)
+
+                    bool needByHash = !File.Exists(localPath) || GetMD5(localPath) != kvp.Value;
+                    bool needByMeta = false;
+
+                    if (!needByHash && File.Exists(localPath))
                     {
-                        m_DownloadQueue.Add(key); // en remoto usamos la clave tal cual (puede incluir Data/)
+                        var fi = new FileInfo(localPath);
+                        long localSize = fi.Length;
+                        var localMtimeUtc = fi.LastWriteTimeUtc;
+
+                        var (remoteLen, remoteLm) = await TryGetRemoteMetaAsync(m_PatchUri + key).ConfigureAwait(false);
+
+                        if (remoteLen > 0 && remoteLen != localSize)
+                            needByMeta = true;
+
+                        // ⚠️ Descomenta SOLO si tu Last-Modified es estable (algunos CDNs lo cambian en cada request)
+                        // if (!needByMeta && remoteLm.HasValue)
+                        // {
+                        //     var delta = (remoteLm.Value.UtcDateTime - localMtimeUtc).TotalSeconds;
+                        //     if (Math.Abs(delta) > 2.0)
+                        //         needByMeta = true;
+                        // }
+                    }
+
+                    if (needByHash || needByMeta)
+                    {
+                        m_DownloadQueue.Add(key);
                         long size = await TryGetContentLengthAsync(m_PatchUri + key).ConfigureAwait(false);
                         if (size > 0) _bytesTotalExpected += size;
                     }
@@ -131,7 +150,6 @@ namespace WoWLauncher.Patcher
                     return;
                 }
 
-                // 5) Descarga con progreso global
                 IsPatching = true;
                 _speedSw.Restart();
 
@@ -141,47 +159,70 @@ namespace WoWLauncher.Patcher
                     m_WndRef.playBtn.IsEnabled = false;
                     m_WndRef.progressBar.Value = 0;
                     m_WndRef.progressBar.Maximum = Math.Max((double)_bytesTotalExpected, 1.0);
+                    m_WndRef.progressBar.IsIndeterminate = (_bytesTotalExpected == 0);
                 }).ConfigureAwait(false);
 
                 for (m_CurrentIndex = 0; m_CurrentIndex < m_DownloadQueue.Count; m_CurrentIndex++)
                 {
                     string key = m_DownloadQueue[m_CurrentIndex];
-
                     string localRel = key.StartsWith("Data/", StringComparison.OrdinalIgnoreCase)
                         ? key.Substring("Data/".Length)
                         : key;
 
-                    string url = m_PatchUri + key; // remoto
+                    string url = m_PatchUri + key;
                     string targetPath = Path.Combine(AppContext.BaseDirectory, "Data", localRel);
 
                     var dir = Path.GetDirectoryName(targetPath);
                     if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                         Directory.CreateDirectory(dir);
 
-                    await DownloadFileAsync(url, targetPath, (bytesThisFile, elapsed) =>
+                    long fileSoFar = 0;
+                    bool fileLengthAppliedToTotal = false;
+
+                    await DownloadFileAsync(url, targetPath, (deltaBytes, elapsed, fileKnownLength) =>
                     {
-                        long downloadedSoFarLong = _bytesTotalDownloaded + bytesThisFile;
+                        fileSoFar += deltaBytes;
+
+                        if (!fileLengthAppliedToTotal && fileKnownLength.HasValue && fileKnownLength.Value > 0)
+                        {
+                            _bytesTotalExpected += fileKnownLength.Value;
+                            fileLengthAppliedToTotal = true;
+
+                            UI_NoAwait(() =>
+                            {
+                                m_WndRef.progressBar.IsIndeterminate = false;
+                                m_WndRef.progressBar.Maximum = Math.Max((double)_bytesTotalExpected, 1.0);
+                            });
+                        }
+
+                        long downloadedSoFarLong = _bytesTotalDownloaded + fileSoFar;
+                        double maximum = Math.Max((double)_bytesTotalExpected, 1.0);
+
+                        double percent = (_bytesTotalExpected > 0)
+                            ? (downloadedSoFarLong / maximum) * 100.0
+                            : 0.0;
+
+                        long remaining = (_bytesTotalExpected > downloadedSoFarLong)
+                            ? (_bytesTotalExpected - downloadedSoFarLong)
+                            : 0;
+
+                        string speedStr = FormatSpeed(deltaBytes, elapsed);
 
                         UI_NoAwait(() =>
                         {
-                            m_WndRef.progressBar.Value = Math.Min((double)downloadedSoFarLong, m_WndRef.progressBar.Maximum);
-
-                            double percent =
-                                m_WndRef.progressBar.Maximum > 0
-                                    ? (m_WndRef.progressBar.Value / m_WndRef.progressBar.Maximum) * 100.0
-                                    : 0.0;
-
-                            string speedStr = FormatSpeed(bytesThisFile, elapsed);
+                            m_WndRef.progressBar.Maximum = maximum;
+                            m_WndRef.progressBar.Value = Math.Min(downloadedSoFarLong, (long)maximum);
 
                             m_WndRef.progressInfo.Text =
                                 string.Format(
-                                    "{0:0.0}%  •  {1}  ({2}/{3})  Descargado {4:0.0}/{5:0.0} MB  Velocidad {6}",
+                                    "{0:0.0}%  •  {1}  ({2}/{3})  Descargado {4:0.0}/{5:0.0} MB  Restante {6:0.0} MB  Velocidad {7}",
                                     percent,
                                     key,
                                     m_CurrentIndex + 1,
                                     m_DownloadQueue.Count,
                                     ToMB(downloadedSoFarLong),
-                                    ToMB(Math.Max(_bytesTotalExpected, downloadedSoFarLong)),
+                                    ToMB(_bytesTotalExpected),
+                                    ToMB(remaining),
                                     speedStr
                                 );
                         });
@@ -195,10 +236,15 @@ namespace WoWLauncher.Patcher
 
                 await UI(() =>
                 {
+                    m_WndRef.progressBar.IsIndeterminate = false;
+                    m_WndRef.progressBar.Maximum = Math.Max((double)_bytesTotalExpected, 1.0);
                     m_WndRef.progressBar.Value = m_WndRef.progressBar.Maximum;
                     m_WndRef.progressInfo.Text = "Descarga de parches completada.";
                     m_WndRef.playBtn.IsEnabled = true;
                 }).ConfigureAwait(false);
+
+                // Limpieza opcional de huérfanos:
+                // PruneFiles(Path.Combine(AppContext.BaseDirectory, "Data"), m_PatchList.Keys);
             }
             catch (Exception ex)
             {
@@ -227,7 +273,6 @@ namespace WoWLauncher.Patcher
 
         private static string EnsureSlash(string url) => url.EndsWith("/") ? url : (url + "/");
 
-        // GET ligero (Range 0-0) para existencia; más fiable que HEAD con algunos proxies/CDN
         private async Task<bool> UrlExistsAsync(string url)
         {
             try
@@ -235,6 +280,7 @@ namespace WoWLauncher.Patcher
                 using (var req = new HttpRequestMessage(HttpMethod.Get, url))
                 {
                     req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                    req.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
                     using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
                         return resp.IsSuccessStatusCode;
                 }
@@ -242,58 +288,151 @@ namespace WoWLauncher.Patcher
             catch { return false; }
         }
 
-        // Intento de obtener Content-Length (si el servidor lo expone)
+        // ✅ Usa TryGetRemoteMetaAsync (HEAD + fallback) para obtener el tamaño TOTAL real
         private async Task<long> TryGetContentLengthAsync(string url)
         {
+            var (len, _) = await TryGetRemoteMetaAsync(url).ConfigureAwait(false);
+            return len;
+        }
+
+        // ✅ HEAD primero; fallback a GET Range: 0-0 leyendo Content-Range.Length
+        private async Task<(long length, DateTimeOffset? lastModified)> TryGetRemoteMetaAsync(string url)
+        {
+            // 1) HEAD
+            try
+            {
+                using (var headReq = new HttpRequestMessage(HttpMethod.Head, url))
+                {
+                    headReq.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
+                    using (var headResp = await _http.SendAsync(headReq, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+                    {
+                        if (headResp.IsSuccessStatusCode)
+                        {
+                            long len = 0;
+                            if (headResp.Content?.Headers?.ContentLength.HasValue == true)
+                                len = headResp.Content.Headers.ContentLength.Value;
+
+                            DateTimeOffset? lm = headResp.Content?.Headers?.LastModified;
+                            if (lm == null && headResp.Headers.TryGetValues("Last-Modified", out var values))
+                            {
+                                if (DateTimeOffset.TryParse(string.Join(",", values), out var parsed))
+                                    lm = parsed;
+                            }
+
+                            if (len > 0 || lm.HasValue)
+                                return (len, lm);
+                        }
+                    }
+                }
+            }
+            catch { /* seguimos al fallback */ }
+
+            // 2) GET Range: 0-0 → leer SIEMPRE Content-Range.Length (no Content-Length del rango)
             try
             {
                 using (var req = new HttpRequestMessage(HttpMethod.Get, url))
                 {
                     req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                    req.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
+
                     using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
                     {
-                        if (resp.Content?.Headers?.ContentLength.HasValue == true)
-                            return resp.Content.Headers.ContentLength.Value;
+                        if (!resp.IsSuccessStatusCode)
+                            return (0, null);
+
+                        long totalLen = 0;
+
+                        var cr = resp.Content?.Headers?.ContentRange;
+                        if (cr != null && cr.HasLength && cr.Length.HasValue)
+                        {
+                            totalLen = cr.Length.Value;
+                        }
+                        else if (resp.Headers.TryGetValues("Content-Range", out var crVals))
+                        {
+                            // "bytes 0-0/123456" → 123456
+                            var s = string.Join(",", crVals);
+                            var slash = s.LastIndexOf('/');
+                            if (slash >= 0 && long.TryParse(s.Substring(slash + 1).Trim(), out var parsedTotal))
+                                totalLen = parsedTotal;
+                        }
+
+                        DateTimeOffset? lm = resp.Content?.Headers?.LastModified;
+                        if (lm == null && resp.Headers.TryGetValues("Last-Modified", out var values))
+                        {
+                            if (DateTimeOffset.TryParse(string.Join(",", values), out var parsed))
+                                lm = parsed;
+                        }
+
+                        return (totalLen, lm);
                     }
                 }
             }
             catch { }
-            return 0;
+
+            return (0, null);
         }
 
-        private async Task DownloadFileAsync(string url, string targetPath, Action<long, TimeSpan> onProgress)
+        private async Task DownloadFileAsync(
+            string url,
+            string targetPath,
+            Action<long, TimeSpan, long?> onProgress)
         {
-            using (var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
+            using (var req = new HttpRequestMessage(HttpMethod.Get, url + (url.Contains("?") ? "&" : "?") + "_cb=" + DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
             {
-                resp.EnsureSuccessStatusCode();
+                req.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
 
-                var dir = Path.GetDirectoryName(targetPath);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-
-                using (var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
-                using (var dst = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
+                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
                 {
-                    var buffer = new byte[81920];
-                    long bytesThisFile = 0;
-                    var sw = Stopwatch.StartNew();
+                    resp.EnsureSuccessStatusCode();
 
-                    while (true)
+                    long? fileLen = resp.Content?.Headers?.ContentLength;
+                    DateTimeOffset? remoteLm = resp.Content?.Headers?.LastModified;
+                    if (remoteLm == null && resp.Headers.TryGetValues("Last-Modified", out var values))
                     {
-                        int read = await src.ReadAsync(buffer, 0, buffer.Length, _cts.Token).ConfigureAwait(false);
-                        if (read <= 0) break;
-
-                        await dst.WriteAsync(buffer, 0, read, _cts.Token).ConfigureAwait(false);
-                        bytesThisFile += read;
-
-                        if (sw.ElapsedMilliseconds >= 200)
-                        {
-                            onProgress(bytesThisFile, sw.Elapsed);
-                            sw.Restart();
-                        }
+                        if (DateTimeOffset.TryParse(string.Join(",", values), out var parsed))
+                            remoteLm = parsed;
                     }
 
-                    onProgress(bytesThisFile, TimeSpan.FromMilliseconds(250));
+                    var dir = Path.GetDirectoryName(targetPath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
+
+                    string tmp = targetPath + ".part";
+                    if (File.Exists(tmp)) File.Delete(tmp);
+
+                    using (var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                    using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, true))
+                    {
+                        var buffer = new byte[1 << 20];
+                        long bytesThisFile = 0;
+                        long lastReported = 0;
+                        var sw = Stopwatch.StartNew();
+
+                        int read;
+                        while ((read = await src.ReadAsync(buffer, 0, buffer.Length, _cts.Token).ConfigureAwait(false)) > 0)
+                        {
+                            await dst.WriteAsync(buffer, 0, read, _cts.Token).ConfigureAwait(false);
+                            bytesThisFile += read;
+
+                            if (sw.ElapsedMilliseconds >= 200)
+                            {
+                                long delta = bytesThisFile - lastReported;
+                                onProgress(delta, sw.Elapsed, fileLen);
+                                lastReported = bytesThisFile;
+                                sw.Restart();
+                            }
+                        }
+
+                        long finalDelta = bytesThisFile - lastReported;
+                        if (finalDelta > 0)
+                            onProgress(finalDelta, TimeSpan.FromMilliseconds(250), fileLen);
+                    }
+
+                    if (File.Exists(targetPath)) File.Delete(targetPath);
+                    File.Move(tmp, targetPath);
+
+                    if (remoteLm.HasValue)
+                        File.SetLastWriteTimeUtc(targetPath, remoteLm.Value.UtcDateTime);
                 }
             }
         }
@@ -314,6 +453,25 @@ namespace WoWLauncher.Patcher
             {
                 byte[] hash = md5.ComputeHash(stream);
                 return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+            }
+        }
+
+        private void PruneFiles(string dataRoot, IEnumerable<string> manifestKeys)
+        {
+            var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var key in manifestKeys)
+            {
+                string rel = key.StartsWith("Data/", StringComparison.OrdinalIgnoreCase) ? key.Substring(5) : key;
+                expected.Add(Path.GetFullPath(Path.Combine(dataRoot, rel)));
+            }
+
+            foreach (var file in Directory.EnumerateFiles(dataRoot, "*", SearchOption.AllDirectories))
+            {
+                var full = Path.GetFullPath(file);
+                if (!expected.Contains(full) && (file.EndsWith(".MPQ", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".patch", StringComparison.OrdinalIgnoreCase)))
+                {
+                    try { File.Delete(full); } catch { }
+                }
             }
         }
 
