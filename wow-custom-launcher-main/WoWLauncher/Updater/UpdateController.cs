@@ -20,9 +20,8 @@ namespace WoWLauncher.Updater
         private WebClient _wcRealm;
 
         // URLs en GitHub
-        private const string UpdateVersionUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/update.txt";
-        private const string ServerAddressUri = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/realm.txt";
-
+        private const string UpdateVersionUri = "https://92e01281701b8cee8449177420951cf8.r2.cloudflarestorage.com/patcher/launcher/update.txt";
+        private const string ServerAddressUri = "https://92e01281701b8cee8449177420951cf8.r2.cloudflarestorage.com/patcher/realm.txt";
         // Rutas locales
         private static readonly string CacheDirL = Path.Combine(AppContext.BaseDirectory, "Cache", "L");
         private static readonly string DataDirEsES = Path.Combine(AppContext.BaseDirectory, "Data", "esES"); // <- Data en mayúscula

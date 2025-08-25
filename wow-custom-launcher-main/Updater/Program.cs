@@ -43,7 +43,7 @@ namespace Updater
                 string tag = "v" + ver;                            // ej. "v1.2"
 
                 // 2) Descargar zip
-                string zipUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tag}/client.zip";
+                string zipUrl = $"https://92e01281701b8cee8449177420951cf8.r2.cloudflarestorage.com/patcher/client.zip";
                 string zipPath = Path.Combine(CacheDir, "client.zip");
                 File.AppendAllText(logFile, $"Descargando desde: {zipUrl}\n");
 

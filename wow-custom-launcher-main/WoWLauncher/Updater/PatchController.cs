@@ -1,5 +1,5 @@
 ﻿// PatchController.cs — HttpClient, progreso y velocidad, y sin cierres inesperados.
-// Compatible con .NET Framework/WPF clásico.
+// Solo “live” (sin beta). Compatible con .NET Framework/WPF clásico.
 
 using System;
 using System.Collections.Generic;
@@ -13,7 +13,7 @@ using System.Threading.Tasks;
 
 namespace WoWLauncher.Patcher
 {
-    internal class PatchController
+    public class PatchController
     {
         private readonly MainWindow m_WndRef;
 
@@ -47,33 +47,39 @@ namespace WoWLauncher.Patcher
                 AllowAutoRedirect = true,
                 UseProxy = true
             };
-            _http = new HttpClient(handler);
-            _http.Timeout = TimeSpan.FromMinutes(10);
+            _http = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromMinutes(10)
+            };
 
             _cts = new CancellationTokenSource();
         }
 
+        // === MÉTODO PÚBLICO QUE ESTÁS BUSCANDO ===
         public async void CheckPatch(bool _init = true)
         {
             try
             {
-                // === Resolver URLs base ===
+                // === Resolver URLs base (solo LIVE) ===
                 string verFile = Path.Combine(AppContext.BaseDirectory, "Cache", "L", "version.txt");
                 string ver = File.Exists(verFile) ? File.ReadAllText(verFile).Trim() : "0.0";
 
+                // 1) Intentar con releases/tag vX.Y (live)
                 string tagV = "v" + ver;
                 string baseUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tagV}/";
                 string testUrl = baseUrl + "plist.txt";
 
-                if (!await UrlExistsAsync(testUrl))
+                if (!await UrlExistsAsync(testUrl).ConfigureAwait(false))
                 {
+                    // 2) Intentar con releases/tag X.Y (sin la 'v')
                     string tagNoV = ver;
                     baseUrl = $"https://github.com/ninjapal453/Actualizador-Wow/releases/download/{tagNoV}/";
                     testUrl = baseUrl + "plist.txt";
                 }
 
-                if (!await UrlExistsAsync(testUrl))
+                if (!await UrlExistsAsync(testUrl).ConfigureAwait(false))
                 {
+                    // 3) Fallback a rama main (live)
                     baseUrl = "https://raw.githubusercontent.com/ninjapal453/Actualizador-Wow/main/Patch/";
                     testUrl = baseUrl + "plist.txt";
                 }
@@ -82,7 +88,8 @@ namespace WoWLauncher.Patcher
                 m_PatchListUri = testUrl;
 
                 // === Descargar y procesar plist ===
-                string rawData = await _http.GetStringAsync(m_PatchListUri);
+                string rawData = await _http.GetStringAsync(m_PatchListUri).ConfigureAwait(false);
+
                 Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "Cache", "P"));
                 File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "Cache", "P", "plist_debug.txt"), rawData);
 
@@ -114,7 +121,7 @@ namespace WoWLauncher.Patcher
                         m_DownloadQueue.Add(kvp.Key);
 
                         // Intentar leer tamaño por adelantado (para barra global)
-                        long size = await TryGetContentLengthAsync(m_PatchUri + kvp.Key);
+                        long size = await TryGetContentLengthAsync(m_PatchUri + kvp.Key).ConfigureAwait(false);
                         if (size > 0) _bytesTotalExpected += size;
                     }
                 }
@@ -129,7 +136,7 @@ namespace WoWLauncher.Patcher
                         m_WndRef.progressBar.Maximum = 1;
                         m_WndRef.progressInfo.Text = "Parches actualizados.";
                         m_WndRef.playBtn.IsEnabled = true;
-                    });
+                    }).ConfigureAwait(false);
                     return;
                 }
 
@@ -143,7 +150,7 @@ namespace WoWLauncher.Patcher
                     m_WndRef.playBtn.IsEnabled = false;
                     m_WndRef.progressBar.Value = 0;
                     m_WndRef.progressBar.Maximum = Math.Max((double)_bytesTotalExpected, 1.0);
-                });
+                }).ConfigureAwait(false);
 
                 for (m_CurrentIndex = 0; m_CurrentIndex < m_DownloadQueue.Count; m_CurrentIndex++)
                 {
@@ -182,7 +189,7 @@ namespace WoWLauncher.Patcher
                                     speedStr
                                 );
                         });
-                    });
+                    }).ConfigureAwait(false);
 
                     _bytesTotalDownloaded += new FileInfo(targetPath).Length;
                 }
@@ -195,7 +202,7 @@ namespace WoWLauncher.Patcher
                     m_WndRef.progressBar.Value = m_WndRef.progressBar.Maximum;
                     m_WndRef.progressInfo.Text = "Descarga de parches completada.";
                     m_WndRef.playBtn.IsEnabled = true;
-                });
+                }).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -216,7 +223,7 @@ namespace WoWLauncher.Patcher
                         "Patch Error", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
                     m_WndRef.progressInfo.Text = "Error en la descarga de parches.";
                     m_WndRef.playBtn.IsEnabled = true;
-                });
+                }).ConfigureAwait(false);
             }
         }
 
@@ -227,7 +234,7 @@ namespace WoWLauncher.Patcher
             try
             {
                 var req = new HttpRequestMessage(HttpMethod.Head, url);
-                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
                 {
                     return resp.IsSuccessStatusCode;
                 }
@@ -240,7 +247,7 @@ namespace WoWLauncher.Patcher
             try
             {
                 var req = new HttpRequestMessage(HttpMethod.Head, url);
-                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
                 {
                     if (resp.Content != null && resp.Content.Headers != null && resp.Content.Headers.ContentLength.HasValue)
                         return resp.Content.Headers.ContentLength.Value;
@@ -252,7 +259,7 @@ namespace WoWLauncher.Patcher
 
         private async Task DownloadFileAsync(string url, string targetPath, Action<long, TimeSpan> onProgress)
         {
-            using (var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, _cts.Token))
+            using (var resp = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, _cts.Token).ConfigureAwait(false))
             {
                 resp.EnsureSuccessStatusCode();
 
@@ -260,7 +267,7 @@ namespace WoWLauncher.Patcher
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
-                using (var src = await resp.Content.ReadAsStreamAsync())
+                using (var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
                 using (var dst = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
                 {
                     var buffer = new byte[81920];
@@ -269,10 +276,10 @@ namespace WoWLauncher.Patcher
 
                     while (true)
                     {
-                        int read = await src.ReadAsync(buffer, 0, buffer.Length, _cts.Token);
+                        int read = await src.ReadAsync(buffer, 0, buffer.Length, _cts.Token).ConfigureAwait(false);
                         if (read <= 0) break;
 
-                        await dst.WriteAsync(buffer, 0, read, _cts.Token);
+                        await dst.WriteAsync(buffer, 0, read, _cts.Token).ConfigureAwait(false);
                         bytesThisFile += read;
 
                         if (sw.ElapsedMilliseconds >= 200)
